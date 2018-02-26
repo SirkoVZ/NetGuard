@@ -115,7 +115,6 @@ import javax.net.ssl.HttpsURLConnection;
 public class ServiceSinkhole extends VpnService implements SharedPreferences.OnSharedPreferenceChangeListener {
     private static final String TAG = "NetGuard.Service";
 
-    private boolean registeredPowerSave = false;
     private boolean registeredUser = false;
     private boolean registeredIdleState = false;
     private boolean registeredConnectivityChanged = false;
@@ -132,7 +131,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
     private boolean last_connected = false;
     private boolean last_metered = true;
     private boolean last_interactive = false;
-    private boolean powersaving = false;
 
     private int last_allowed = -1;
     private int last_blocked = -1;
@@ -148,7 +146,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
     private Map<String, Boolean> mapHostsBlocked = new HashMap<>();
     private Map<Integer, Boolean> mapUidAllowed = new HashMap<>();
     private Map<Integer, Integer> mapUidKnown = new HashMap<>();
-    private final Map<Long, Map<InetAddress, IPRule>> mapUidIPFilters = new HashMap<>();
+    private final Map<IPKey, Map<InetAddress, IPRule>> mapUidIPFilters = new HashMap<>();
     private Map<Integer, Forward> mapForward = new HashMap<>();
     private Map<Integer, Boolean> mapNotify = new HashMap<>();
     private ReentrantReadWriteLock lock = new ReentrantReadWriteLock(true);
@@ -715,9 +713,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
         @Override
         public void handleMessage(Message msg) {
             try {
-                if (powersaving && (msg.what == MSG_PACKET || msg.what == MSG_USAGE))
-                    return;
-
                 switch (msg.what) {
                     case MSG_PACKET:
                         log((Packet) msg.obj, msg.arg1, msg.arg2 > 0);
@@ -1592,15 +1587,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                 }
             }
 
-            // long is 64 bits
-            // 0..15 uid
-            // 16..31 dport
-            // 32..39 protocol
-            // 40..43 version
-            if (!(protocol == 6 /* TCP */ || protocol == 17 /* UDP */))
-                dport = 0;
-            long key = (version << 40) | (protocol << 32) | (dport << 16) | uid;
-
+            IPKey key = new IPKey(version, protocol, dport, uid);
             synchronized (mapUidIPFilters) {
                 if (!mapUidIPFilters.containsKey(key))
                     mapUidIPFilters.put(key, new HashMap());
@@ -1615,17 +1602,17 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                             continue;
 
                         //if (dname != null)
-                        Log.i(TAG, "Set filter uid=" + uid + " " + daddr + " " + dresource + "/" + dport + "=" + block);
+                        Log.i(TAG, "Set filter " + key + " " + daddr + "/" + dresource + "=" + block);
 
                         boolean exists = mapUidIPFilters.get(key).containsKey(iname);
                         if (!exists || !mapUidIPFilters.get(key).get(iname).isBlocked()) {
-                            IPRule rule = new IPRule(name + "/" + iname, block, time + ttl);
+                            IPRule rule = new IPRule(key, name + "/" + iname, block, time + ttl);
                             mapUidIPFilters.get(key).put(iname, rule);
                             if (exists)
-                                Log.w(TAG, "Address conflict uid=" + uid + " " + daddr + " " + dresource + "/" + dport);
+                                Log.w(TAG, "Address conflict " + key + " " + daddr + "/" + dresource);
                         } else if (exists) {
                             mapUidIPFilters.get(key).get(iname).updateExpires(time + ttl);
-                            Log.w(TAG, "Address updated uid=" + uid + " " + daddr + " " + dresource + "/" + dport);
+                            Log.w(TAG, "Address updated " + key + " " + daddr + "/" + dresource);
                         }
                     } else
                         Log.w(TAG, "Address not numeric " + name);
@@ -1852,10 +1839,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                 Log.w(TAG, "Allowing self " + packet);
             } else {
                 boolean filtered = false;
-                // Only TCP (6) and UDP (17) have port numbers
-                int dport = (packet.protocol == 6 || packet.protocol == 17 ? packet.dport : 0);
-                long key = (packet.version << 40) | (packet.protocol << 32) | (dport << 16) | packet.uid;
-
+                IPKey key = new IPKey(packet.version, packet.protocol, packet.dport, packet.uid);
                 if (mapUidIPFilters.containsKey(key))
                     try {
                         InetAddress iaddr = InetAddress.getByName(packet.daddr);
@@ -1957,7 +1941,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
 
                         // Start/stop stats
                         statsHandler.sendEmptyMessage(
-                                Util.isInteractive(ServiceSinkhole.this) && !powersaving ? MSG_STATS_START : MSG_STATS_STOP);
+                                Util.isInteractive(ServiceSinkhole.this) ? MSG_STATS_START : MSG_STATS_STOP);
                     } catch (Throwable ex) {
                         Log.e(TAG, ex.toString() + "\n" + Log.getStackTraceString(ex));
 
@@ -1968,22 +1952,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                     }
                 }
             });
-        }
-    };
-
-    private BroadcastReceiver powerSaveReceiver = new BroadcastReceiver() {
-        @Override
-        @TargetApi(Build.VERSION_CODES.LOLLIPOP)
-        public void onReceive(Context context, Intent intent) {
-            Log.i(TAG, "Received " + intent);
-            Util.logExtras(intent);
-
-            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            powersaving = pm.isPowerSaveMode();
-            Log.i(TAG, "Power saving=" + powersaving);
-
-            statsHandler.sendEmptyMessage(
-                    Util.isInteractive(ServiceSinkhole.this) && !powersaving ? MSG_STATS_START : MSG_STATS_STOP);
         }
     };
 
@@ -2009,7 +1977,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                     start("foreground", ServiceSinkhole.this);
                 }
             } else
-                stop("background", ServiceSinkhole.this, false);
+                stop("background", ServiceSinkhole.this, true);
         }
     };
 
@@ -2349,16 +2317,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
         logHandler = new LogHandler(logLooper);
         statsHandler = new StatsHandler(statsLooper);
 
-        // Listen for power save mode
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && !Util.isPlayStoreInstall(this)) {
-            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-            powersaving = pm.isPowerSaveMode();
-            IntentFilter ifPower = new IntentFilter();
-            ifPower.addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED);
-            registerReceiver(powerSaveReceiver, ifPower);
-            registeredPowerSave = true;
-        }
-
         // Listen for user switches
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
             IntentFilter ifUser = new IntentFilter();
@@ -2620,10 +2578,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
             }
 
             // Register in onCreate
-            if (registeredPowerSave) {
-                unregisterReceiver(powerSaveReceiver);
-                registeredPowerSave = false;
-            }
             if (registeredUser) {
                 unregisterReceiver(userReceiver);
                 registeredUser = false;
@@ -3057,12 +3011,50 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
         }
     }
 
+    private class IPKey {
+        int version;
+        int protocol;
+        int dport;
+        int uid;
+
+        public IPKey(int version, int protocol, int dport, int uid) {
+            this.version = version;
+            this.protocol = protocol;
+            // Only TCP (6) and UDP (17) have port numbers
+            this.dport = (protocol == 6 || protocol == 17 ? dport : 0);
+            this.uid = uid;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (!(obj instanceof IPKey))
+                return false;
+            IPKey other = (IPKey) obj;
+            return (this.version == other.version &&
+                    this.protocol == other.protocol &&
+                    this.dport == other.dport &&
+                    this.uid == other.uid);
+        }
+
+        @Override
+        public int hashCode() {
+            return (version << 40) | (protocol << 32) | (dport << 16) | uid;
+        }
+
+        @Override
+        public String toString() {
+            return "v" + version + " p" + protocol + " port=" + dport + " uid=" + uid;
+        }
+    }
+
     private class IPRule {
+        private IPKey key;
         private String name;
         private boolean block;
         private long expires;
 
-        public IPRule(String name, boolean block, long expires) {
+        public IPRule(IPKey key, String name, boolean block, long expires) {
+            this.key = key;
             this.name = name;
             this.block = block;
             this.expires = expires;
@@ -3088,7 +3080,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
 
         @Override
         public String toString() {
-            return this.name;
+            return this.key + " " + this.name;
         }
     }
 
